@@ -3,6 +3,11 @@
 单一数据库文件同时保存事件和计算结果，因此一次提交可以原子写入事件及其
 全部影响，失败时也不会留下部分数据。数据库位于挂载卷时，WAL 模式可在
 容器重启后继续保留数据。
+
+结构（建表、列、索引与版本记录）完全由 :mod:`app.migrations` 管理；
+``Repository`` 假定打开时数据库已通过 ``prepare_database`` 迁移并校验到
+当前版本，因此这里不再执行任何 ``CREATE TABLE IF NOT EXISTS``——那条语句
+正是早期“结构漂移却静默成功”问题的根源。
 """
 
 from __future__ import annotations
@@ -14,45 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    event_id             TEXT PRIMARY KEY,
-    event_version        INTEGER NOT NULL,
-    event_type           TEXT NOT NULL,
-    airport_code         TEXT NOT NULL,
-    effective_from       TEXT NOT NULL,
-    effective_until      TEXT,
-    reported_at          TEXT NOT NULL,
-    supersedes_event_id  TEXT,
-    reason               TEXT,
-    payload_json         TEXT NOT NULL,
-    replay_count         INTEGER NOT NULL DEFAULT 0,
-    created_at           TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS impacts (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id           TEXT NOT NULL REFERENCES events(event_id),
-    root_event_id      TEXT NOT NULL,
-    airport_code       TEXT NOT NULL,
-    flight_id          TEXT NOT NULL,
-    flight_number      TEXT NOT NULL,
-    affected_endpoint  TEXT NOT NULL,
-    impact_status      TEXT NOT NULL,
-    overlap_minutes    INTEGER,
-    delay_minutes      INTEGER,
-    proposed_departure TEXT,
-    proposed_arrival   TEXT,
-    passenger_count    INTEGER NOT NULL,
-    crosses_midnight   INTEGER NOT NULL,
-    UNIQUE(event_id, flight_id, airport_code)
-);
-
-CREATE INDEX IF NOT EXISTS idx_impacts_root    ON impacts(root_event_id);
-CREATE INDEX IF NOT EXISTS idx_impacts_airport ON impacts(airport_code, impact_status);
-CREATE INDEX IF NOT EXISTS idx_impacts_flight  ON impacts(flight_id);
-CREATE INDEX IF NOT EXISTS idx_events_airport  ON events(airport_code, event_version);
-"""
+from app.migrations import light_verify_current_schema
 
 
 def utcnow_iso() -> str:
@@ -60,9 +27,13 @@ def utcnow_iso() -> str:
 
 
 class Repository:
-    """对单一 SQLite 连接提供线程安全封装。"""
+    """对单一 SQLite 连接提供线程安全封装。
 
-    def __init__(self, db_path: Path):
+    打开时只设置连接参数并做一次结构复核；建表/迁移由
+    ``migrations.prepare_database`` 在打开前完成。
+    """
+
+    def __init__(self, db_path: Path, *, verify: bool = True):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
@@ -73,7 +44,13 @@ class Repository:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.executescript(SCHEMA)
+            if verify:
+                problems = light_verify_current_schema(self._conn)
+                if problems:
+                    self._conn.close()
+                    from app.migrations import SchemaDriftError
+
+                    raise SchemaDriftError(problems)
 
     def close(self) -> None:
         with self._lock:
@@ -83,6 +60,14 @@ class Repository:
         with self._lock:
             row = self._conn.execute("SELECT 1").fetchone()
             return row is not None and row[0] == 1
+
+    def ready_problems(self) -> list[str]:
+        """就绪探针：返回当前结构问题；空列表表示可以接流量。"""
+        with self._lock:
+            problems = light_verify_current_schema(self._conn)
+            if not problems and not self.ping():
+                problems.append("storage is not responding")
+            return problems
 
     # ------------------------------------------------------------------ #
     # Reads

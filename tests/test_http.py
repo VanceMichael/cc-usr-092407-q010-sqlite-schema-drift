@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
+from app.lifecycle import Application
 from app.server import build_server
 from tests.support import ServiceTestCase, base_event
 
@@ -30,7 +31,12 @@ def _request(method: str, url: str, body=None):
 class HttpTest(ServiceTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.server: ThreadingHTTPServer = build_server("127.0.0.1", 0, self.service)
+        self.app = Application.prepared(
+            self.db_path, self.airports, self.flights
+        )
+        self.server: ThreadingHTTPServer = build_server(
+            "127.0.0.1", 0, self.app
+        )
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -40,12 +46,26 @@ class HttpTest(ServiceTestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        self.app.shutdown()
         super().tearDown()
 
     def test_health(self) -> None:
         status, body = _request("GET", f"{self.base}/healthz")
         self.assertEqual(status, 200)
-        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["status"], "alive")
+
+    def test_readiness(self) -> None:
+        status, body = _request("GET", f"{self.base}/readyz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ready")
+        self.assertEqual(body["schema_version"], 3)
+
+    def test_migration_diagnostics_current(self) -> None:
+        status, body = _request("GET", f"{self.base}/migrationz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "current")
+        self.assertEqual(body["schema_version"], 3)
+        self.assertEqual([a["version"] for a in body["applied"]], [1, 2, 3])
 
     def test_valid_event_round_trip(self) -> None:
         status, body = _request("POST", f"{self.base}/api/v1/events", base_event())

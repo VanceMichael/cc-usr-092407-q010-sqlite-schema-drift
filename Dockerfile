@@ -28,7 +28,9 @@ ENV PYTHONUNBUFFERED=1 \
 VOLUME ["/data"]
 EXPOSE 8080
 
+# 就绪探针驱动流量接入：迁移期间或结构异常时返回 503，编排平台据此摘流量。
+# 存活探针 /healthz 始终可应答，迁移期间不会被误杀。
 HEALTHCHECK --interval=3s --timeout=3s --start-period=2s --retries=10 \
-    CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1
 
 CMD ["python", "-m", "app"]

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from app.config import ROOT, load_airports, load_flights
+from app.migrations import prepare_database
 from app.repository import Repository
 from app.service import DisruptionService
 
@@ -19,6 +20,7 @@ class ServiceTestCase(unittest.TestCase):
         self.db_path = Path(self._tmp.name) / "test.db"
         self.airports = load_airports(FIXTURES_DIR)
         self.flights = load_flights(FIXTURES_DIR, self.airports)
+        prepare_database(self.db_path)
         self.repo = Repository(self.db_path)
         self.service = DisruptionService(self.repo, self.airports, self.flights)
 
@@ -29,6 +31,7 @@ class ServiceTestCase(unittest.TestCase):
     def restart_service(self) -> DisruptionService:
         """模拟容器重启后重新打开同一数据库文件。"""
         self.repo.close()
+        prepare_database(self.db_path)
         self.repo = Repository(self.db_path)
         self.service = DisruptionService(self.repo, self.airports, self.flights)
         return self.service

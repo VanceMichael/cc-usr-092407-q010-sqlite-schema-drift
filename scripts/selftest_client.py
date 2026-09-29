@@ -374,9 +374,23 @@ def seed() -> int:
         status, _ = request("GET", f"/api/v1/events/{invalid_id}")
         check(status == 404, f"rejected event '{invalid_id}' was never persisted")
 
-    print("== seed: health ==")
+    print("== seed: health / readiness / migration diagnostics ==")
     status, health = request("GET", "/healthz")
-    check(status == 200 and health["status"] == "ok", "health endpoint reports ok")
+    check(status == 200 and health["status"] == "alive",
+          f"liveness endpoint reports alive (got {status}/{health.get('status')})")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready",
+          f"readiness endpoint reports ready (got {status}/{ready.get('status')})")
+    check(ready.get("schema_version") == 3,
+          f"readiness advertises schema_version 3 (got {ready.get('schema_version')})")
+    status, migration = request("GET", "/migrationz")
+    check(status == 200 and migration["status"] == "current",
+          f"migration diagnostics report current (got {status}/{migration.get('status')})")
+    check(
+        "/data" not in json.dumps(migration)
+        and "disruptions.db" not in json.dumps(migration),
+        "migration diagnostics do not leak filesystem paths",
+    )
 
     return finish("seed")
 
@@ -386,9 +400,17 @@ def seed() -> int:
 # --------------------------------------------------------------------------- #
 
 def verify() -> int:
-    print("== verify: service is healthy after restart ==")
+    print("== verify: liveness + readiness after restart ==")
     status, health = request("GET", "/healthz")
-    check(status == 200 and health["status"] == "ok", "health endpoint ok after restart")
+    check(status == 200 and health["status"] == "alive",
+          "liveness endpoint alive after restart")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready",
+          f"readiness endpoint ready after restart (got {status})")
+    status, migration = request("GET", "/migrationz")
+    check(status == 200 and migration["status"] == "current"
+          and migration["schema_version"] == 3,
+          "migration diagnostics current at version 3 after restart")
 
     print("== verify: events and impacts survived the restart ==")
     status, aps1 = request("GET", f"/api/v1/events/{APS_CLOSE}")

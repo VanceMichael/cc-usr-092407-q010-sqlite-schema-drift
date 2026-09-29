@@ -15,7 +15,12 @@ from app.errors import (
     NotFoundError,
     UnsupportedMediaTypeError,
 )
-from app.service import DisruptionService
+from app.lifecycle import (
+    PHASE_MIGRATING,
+    PHASE_READY,
+    PHASE_STARTING,
+    Application,
+)
 
 MAX_BODY_BYTES = 64 * 1024
 DEFAULT_LIMIT = 50
@@ -23,8 +28,8 @@ MAX_LIMIT = 200
 
 
 class AppState:
-    def __init__(self, service: DisruptionService):
-        self.service = service
+    def __init__(self, app: Application):
+        self.app = app
 
 
 def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
@@ -63,13 +68,21 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
                 if path == "/healthz":
                     self._require_method(method, "GET", path)
-                    if not state.service.healthy():
-                        self._send_json(
-                            503,
-                            {"status": "degraded", "detail": "storage unavailable"},
-                        )
-                        return
-                    self._send_json(200, {"status": "ok"})
+                    # 存活探针：进程能响应即存活。迁移进行中或迁移失败都不
+                    # 应被编排平台杀死（失败时靠就绪探针摘流量并暴露诊断）。
+                    self._send_json(
+                        200, {"status": "alive", "phase": state.app.status.phase}
+                    )
+                    return
+
+                if path == "/readyz":
+                    self._require_method(method, "GET", path)
+                    self._readiness()
+                    return
+
+                if path == "/migrationz":
+                    self._require_method(method, "GET", path)
+                    self._migration_diagnostics()
                     return
 
                 if path == "/api/v1" or path == "/":
@@ -84,15 +97,22 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
                                 "GET  /healthz",
+                                "GET  /readyz",
+                                "GET  /migrationz",
                             ],
                         },
                     )
                     return
 
+                # 业务接口必须在迁移完成、结构复核通过后才允许接流量。
+                service = self._require_service()
+                if service is None:
+                    return
+
                 match = re.fullmatch(r"/api/v1/events/([A-Za-z0-9-]+)", path)
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.event_status(match.group(1)))
+                    self._send_json(200, service.event_status(match.group(1)))
                     return
 
                 match = re.fullmatch(
@@ -100,25 +120,25 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 )
                 if match:
                     self._require_method(method, "GET", path)
-                    self._send_json(200, state.service.airport_summary(match.group(1)))
+                    self._send_json(200, service.airport_summary(match.group(1)))
                     return
 
                 if path == "/api/v1/flights/affected":
                     self._require_method(method, "GET", path)
-                    self._send_json(200, self._affected_flights(query))
+                    self._send_json(200, self._affected_flights(query, service))
                     return
 
                 if path == "/api/v1/events":
                     self._require_method(method, "POST", path)
                     payload = self._read_json_body()
-                    self._send_json(201, state.service.submit_event(payload))
+                    self._send_json(201, service.submit_event(payload))
                     return
 
                 raise NotFoundError(f"No route for {method} {path}")
 
             except AppError as exc:
                 self._send_json(exc.status, exc.to_dict())
-            except Exception as exc:  # never leak a stack trace to clients
+            except Exception:  # never leak a stack trace to clients
                 import traceback
 
                 traceback.print_exc()
@@ -126,6 +146,109 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                     500,
                     {"error": {"code": "internal_error", "message": "Internal server error"}},
                 )
+
+        # ------------------------------------------------------------------ #
+        # Readiness / migration probes
+        # ------------------------------------------------------------------ #
+
+        def _readiness(self) -> None:
+            status = state.app.status
+            if status.phase in (PHASE_STARTING, PHASE_MIGRATING):
+                self._send_json(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "reason": "schema_migration_in_progress",
+                        "phase": status.phase,
+                    },
+                    {"Retry-After": "1"},
+                )
+                return
+            if status.phase != PHASE_READY:
+                self._send_json(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "reason": status.code or "startup_failed",
+                        "message": status.message or "service failed to start",
+                        "problems": status.problems,
+                    },
+                    {"Retry-After": "5"},
+                )
+                return
+
+            problems = state.app.ready_problems()
+            if problems:
+                # 运行期结构被破坏或存储故障：立刻摘流量，但信息不含路径。
+                self._send_json(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "reason": "storage_unavailable",
+                        "problems": problems,
+                    },
+                    {"Retry-After": "5"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "status": "ready",
+                    "schema_version": status.prepared.schema_version
+                    if status.prepared
+                    else None,
+                },
+            )
+
+        def _migration_diagnostics(self) -> None:
+            status = state.app.status
+            body = state.app.migration_diagnostics()
+            if status.phase in (PHASE_STARTING, PHASE_MIGRATING):
+                self._send_json(503, {"status": "migrating", **body})
+            elif status.phase == PHASE_READY:
+                self._send_json(200, {"status": "current", **body})
+            else:
+                # 终态错误（版本过新 / 结构漂移 / 存储不可用）。
+                self._send_json(500, {"status": "failed", **body})
+
+        def _require_service(self):
+            """未就绪时对所有业务请求返回 503；就绪则返回业务服务。
+
+            阶段在启动结束后即为稳定终态；运行期的存储/结构退化由
+            ``/readyz`` 探针周期性发现并触发编排平台摘流量。
+            """
+            status = state.app.status
+            if status.phase == PHASE_READY:
+                return state.app.service
+
+            if status.phase in (PHASE_STARTING, PHASE_MIGRATING):
+                self._send_json(
+                    503,
+                    {
+                        "error": {
+                            "code": "service_not_ready",
+                            "message": "service is starting; schema migration in progress",
+                        }
+                    },
+                    {"Retry-After": "1"},
+                )
+                return None
+
+            self._send_json(
+                503,
+                {
+                    "error": {
+                        "code": "service_not_ready",
+                        "message": "service is not ready to serve requests",
+                        "details": {
+                            "reason": status.code or "startup_failed",
+                            "problems": status.problems,
+                        },
+                    }
+                },
+                {"Retry-After": "5"},
+            )
+            return None
 
         def _require_method(self, method: str, expected: str, path: str) -> None:
             if method != expected:
@@ -169,7 +292,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 ) from None
             return payload
 
-        def _affected_flights(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        def _affected_flights(self, query: dict[str, list[str]], service) -> dict[str, Any]:
             def one(name: str) -> str | None:
                 values = query.get(name)
                 if values is None:
@@ -182,7 +305,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
             limit = self._parse_int(one("limit"), DEFAULT_LIMIT, "limit", 1, MAX_LIMIT)
             offset = self._parse_int(one("offset"), 0, "offset", 0, 100_000)
-            return state.service.affected_flights(
+            return service.affected_flights(
                 airport=one("airport"),
                 status=one("status"),
                 limit=limit,
@@ -209,19 +332,26 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 )
             return value
 
-        def _send_json(self, status: int, body: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            status: int,
+            body: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> None:
             data = json.dumps(body, ensure_ascii=False, sort_keys=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 
     return Handler
 
 
-def build_server(host: str, port: int, service: DisruptionService) -> ThreadingHTTPServer:
-    state = AppState(service)
+def build_server(host: str, port: int, app: Application) -> ThreadingHTTPServer:
+    state = AppState(app)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     return server
