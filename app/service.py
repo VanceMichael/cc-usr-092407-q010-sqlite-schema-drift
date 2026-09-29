@@ -8,6 +8,7 @@ from typing import Any
 
 from app.errors import EventConflictError, NotFoundError, ValidationError
 from app.engine import compute_impacts
+from app.migrations import MigrationState
 from app.models import (
     EVENT_CLOSED,
     EVENT_EXTENDED,
@@ -32,7 +33,15 @@ class DisruptionService:
         self._flights = flights
 
     def healthy(self) -> bool:
+        """存活探针：进程与数据库连接可执行最简单的往返即可。"""
         return self._repo.ping()
+
+    def ready(self) -> bool:
+        """就绪探针：schema 迁移完成且结构校验通过才允许接流量。"""
+        return self._repo.ready and self._repo.ping()
+
+    def migration_state(self) -> MigrationState:
+        return self._repo.migration_state
 
     # ------------------------------------------------------------------ #
     # Event intake

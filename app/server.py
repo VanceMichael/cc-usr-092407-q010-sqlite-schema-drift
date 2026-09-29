@@ -13,6 +13,7 @@ from app.errors import (
     BadRequestError,
     MethodNotAllowedError,
     NotFoundError,
+    ServiceUnavailableError,
     UnsupportedMediaTypeError,
 )
 from app.service import DisruptionService
@@ -61,6 +62,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 path = parts.path.rstrip("/") or "/"
                 query = parse_qs(parts.query)
 
+                # --- 存活探针：只回答"进程与数据库连接是否活着"。
+                # 结构漂移/版本过新不杀进程（重启无济于事），因此这里不看
+                # 迁移状态；连接往返失败才报降级。
                 if path == "/healthz":
                     self._require_method(method, "GET", path)
                     if not state.service.healthy():
@@ -70,6 +74,42 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                         )
                         return
                     self._send_json(200, {"status": "ok"})
+                    return
+
+                # --- 就绪探针：迁移完成且结构校验通过才允许接流量。
+                if path == "/readyz":
+                    self._require_method(method, "GET", path)
+                    if not state.service.ready():
+                        self._send_json(
+                            503,
+                            {
+                                "status": "not_ready",
+                                "migration": state.service.migration_state().public_dict(),
+                            },
+                        )
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ready",
+                            "schema_version": state.service.migration_state().current_version,
+                        },
+                    )
+                    return
+
+                # --- 迁移诊断：始终可回答（200），阻断与否只体现在 body 中，
+                # 避免编排层的 503 拦截让运维拿不到诊断细节。就绪闸门是
+                # /readyz 的职责。
+                if path == "/migrations":
+                    self._require_method(method, "GET", path)
+                    migration = state.service.migration_state()
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ok" if migration.ready else "blocked",
+                            "migration": migration.public_dict(),
+                        },
+                    )
                     return
 
                 if path == "/api/v1" or path == "/":
@@ -84,10 +124,21 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
                                 "GET  /healthz",
+                                "GET  /readyz",
+                                "GET  /migrations",
                             ],
                         },
                     )
                     return
+
+                # 业务路径：未就绪（迁移中/被阻止）一律不接流量。
+                if not state.service.ready():
+                    migration = state.service.migration_state()
+                    raise ServiceUnavailableError(
+                        "Service is not ready to accept traffic",
+                        {"reason": migration.reason or "schema_not_ready",
+                         "state": migration.state},
+                    )
 
                 match = re.fullmatch(r"/api/v1/events/([A-Za-z0-9-]+)", path)
                 if match:

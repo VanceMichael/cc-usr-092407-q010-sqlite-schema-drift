@@ -61,3 +61,10 @@ class UnsupportedMediaTypeError(BadRequestError):
 class MethodNotAllowedError(AppError):
     code = "method_not_allowed"
     status = 405
+
+
+class ServiceUnavailableError(AppError):
+    """进程存活但尚未就绪（迁移未完成、结构被阻止等），不得接流量。"""
+
+    code = "service_unavailable"
+    status = 503

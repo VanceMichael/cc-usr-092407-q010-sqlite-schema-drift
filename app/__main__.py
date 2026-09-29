@@ -1,4 +1,8 @@
-"""应用入口：加载夹具、打开数据库并启动 HTTP 服务。"""
+"""应用入口：加载夹具、打开数据库并启动 HTTP 服务。
+
+即使数据库迁移结论为 blocked（版本过新、结构漂移等），HTTP 服务依然启动：
+存活、就绪与迁移诊断端点必须可回答，由就绪探针和流量闸门阻止该实例接流量。
+"""
 
 from __future__ import annotations
 
@@ -14,12 +18,32 @@ def main() -> int:
     config = Config.from_env()
     airports = load_airports(config.fixtures_dir)
     flights = load_flights(config.fixtures_dir, airports)
-    repo = Repository(config.db_path)
+    repo = Repository(config.db_path, migration_lock_timeout=config.migration_lock_timeout)
     service = DisruptionService(repo, airports, flights)
+
+    state = repo.migration_state
+    if state.ready:
+        print(
+            f"airport-disruption schema ready: version {state.current_version} "
+            f"(role={state.role}"
+            + (f", applied={len(state.applied_steps)} step(s)" if state.applied_steps else "")
+            + ")",
+            flush=True,
+        )
+    else:
+        # 诊断行只含结构标识，不含数据库路径。
+        print(
+            f"airport-disruption schema BLOCKED: {state.state} "
+            f"version={state.current_version} reason={state.reason} "
+            f"issues={list(state.issues)}; serving diagnostics only",
+            file=sys.stderr,
+            flush=True,
+        )
+
     server = build_server(config.host, config.port, service)
     print(
         f"airport-disruption service listening on {config.host}:{config.port} "
-        f"(db={config.db_path}, airports={len(airports)}, flights={len(flights)})",
+        f"(airports={len(airports)}, flights={len(flights)}, ready={state.ready})",
         flush=True,
     )
     try:

@@ -1,0 +1,13 @@
+# 滚动升级中断演练覆盖配置（仅 scripts/docker_selftest.sh 使用）。
+#
+# 与 compose.yaml 叠加后：
+# * 注入 MIGRATION_CRASH_AFTER_STEP=2，使实例在 v1->v2 迁移的第 2 步之后、
+#   提交之前硬崩溃（退出码 27），验证事务回滚不留半迁移；
+# * restart: "no"，让第一次启动停在崩溃状态，便于检查退出码与卷上的结构；
+#   随后再次 up 时，卷上的 .migration-crash-sent 哨兵保证相同环境变量不会
+#   再次触发崩溃，实例正常完成迁移。
+services:
+  api:
+    restart: "no"
+    environment:
+      MIGRATION_CRASH_AFTER_STEP: "2"

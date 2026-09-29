@@ -3,66 +3,84 @@
 单一数据库文件同时保存事件和计算结果，因此一次提交可以原子写入事件及其
 全部影响，失败时也不会留下部分数据。数据库位于挂载卷时，WAL 模式可在
 容器重启后继续保留数据。
+
+结构不再由 ``CREATE TABLE IF NOT EXISTS`` 隐式创建：打开数据库时先由
+``app.migrations`` 读取并校验 schema 版本、在选举锁保护下完成顺序迁移，
+只有结论为 ready 时仓储才允许对外提供读写（由服务层/HTTP 层据此拦截）。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    event_id             TEXT PRIMARY KEY,
-    event_version        INTEGER NOT NULL,
-    event_type           TEXT NOT NULL,
-    airport_code         TEXT NOT NULL,
-    effective_from       TEXT NOT NULL,
-    effective_until      TEXT,
-    reported_at          TEXT NOT NULL,
-    supersedes_event_id  TEXT,
-    reason               TEXT,
-    payload_json         TEXT NOT NULL,
-    replay_count         INTEGER NOT NULL DEFAULT 0,
-    created_at           TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS impacts (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id           TEXT NOT NULL REFERENCES events(event_id),
-    root_event_id      TEXT NOT NULL,
-    airport_code       TEXT NOT NULL,
-    flight_id          TEXT NOT NULL,
-    flight_number      TEXT NOT NULL,
-    affected_endpoint  TEXT NOT NULL,
-    impact_status      TEXT NOT NULL,
-    overlap_minutes    INTEGER,
-    delay_minutes      INTEGER,
-    proposed_departure TEXT,
-    proposed_arrival   TEXT,
-    passenger_count    INTEGER NOT NULL,
-    crosses_midnight   INTEGER NOT NULL,
-    UNIQUE(event_id, flight_id, airport_code)
-);
-
-CREATE INDEX IF NOT EXISTS idx_impacts_root    ON impacts(root_event_id);
-CREATE INDEX IF NOT EXISTS idx_impacts_airport ON impacts(airport_code, impact_status);
-CREATE INDEX IF NOT EXISTS idx_impacts_flight  ON impacts(flight_id);
-CREATE INDEX IF NOT EXISTS idx_events_airport  ON events(airport_code, event_version);
-"""
+from app.migrations import (
+    CRASH_ENV,
+    REASON_LOCK_TIMEOUT,
+    REASON_MIGRATION_FAILED,
+    REASON_STORAGE_UNAVAILABLE,
+    MigrationState,
+    bootstrap_database,
+    hard_exit_after_step,
+)
 
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# 这些结论可能在下一轮引导中改变（锁被释放、磁盘恢复、领导者完成迁移），
+# 其余结论（版本过新、结构漂移、索引缺失、损坏）是确定性的，重试无意义。
+_TRANSIENT_REASONS = frozenset(
+    {
+        REASON_LOCK_TIMEOUT,
+        REASON_STORAGE_UNAVAILABLE,
+        REASON_MIGRATION_FAILED,
+    }
+)
+
+
+def _crash_gate(db_path: Path) -> tuple[int | None, Any]:
+    """解析一次性崩溃注入开关。
+
+    MIGRATION_CRASH_AFTER_STEP=N 时，仅当同目录哨兵 ``.migration-crash-sent``
+    不存在才在第 N 步后硬崩溃，并在崩溃前落下哨兵。这样容器带着相同环境
+    变量重启时第二次启动会正常完成迁移，而不是陷入崩溃循环。
+    """
+
+    raw = os.environ.get(CRASH_ENV)
+    if not raw:
+        return None, None
+    try:
+        step = int(raw)
+    except ValueError:
+        return None, None
+    sentinel = db_path.parent / ".migration-crash-sent"
+    if sentinel.exists():
+        return None, None
+
+    def gated_crash(applied: int) -> None:
+        # 构造期到真正执行到该步骤之间，可能已有其他实例先崩溃并落了哨兵
+        # （它持锁先跑）。以哨兵的最终存在性为准，保证整卷只崩溃一次，
+        # 接管迁移的跟随者会正常完成。
+        if sentinel.exists():
+            return
+        # 先持久化哨兵（与数据库在同一卷），再硬退出。
+        sentinel.write_text(f"crashed_after_step={applied}\n", encoding="utf-8")
+        hard_exit_after_step(applied)
+
+    return step, gated_crash
+
+
 class Repository:
     """对单一 SQLite 连接提供线程安全封装。"""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, migration_lock_timeout: float = 30.0):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
@@ -70,10 +88,49 @@ class Repository:
         )
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            # journal_mode=WAL 是持久化设置（之后的打开只读该值）；给一个
+            # 短暂的 busy_timeout，避免多实例首次打开时在 WAL 切换上立刻
+            # 撞上 SQLITE_BUSY。
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.executescript(SCHEMA)
+            # 选举与迁移（内部会把 busy_timeout 临时置 0 自行轮询）。
+            crash_step, crash_action = _crash_gate(db_path)
+            kwargs: dict[str, Any] = {"lock_timeout": migration_lock_timeout}
+            if crash_step is not None:
+                kwargs["crash_after_step"] = crash_step
+                kwargs["crash_action"] = crash_action
+            self._migration_state: MigrationState = bootstrap_database(
+                self._conn, **kwargs
+            )
+            # 正常请求期允许短暂等待其他进程释放写锁。
+            self._conn.execute("PRAGMA busy_timeout=5000")
+
+    @property
+    def migration_state(self) -> MigrationState:
+        return self._migration_state
+
+    @property
+    def ready(self) -> bool:
+        if self._migration_state.ready:
+            return True
+        # 瞬时阻断（等锁超时、存储暂时不可用、迁移步骤失败已整体回滚）：
+        # 在就绪探针上重新走一遍"选举 → 复核"，让跟随者在领导者完成后
+        # 无需重启即可就绪。探针间隔本身就是重试节流。确定性阻断（版本
+        # 过新、结构漂移、索引缺失、损坏）重试不会改变结论，保持 blocked。
+        if self._migration_state.reason in _TRANSIENT_REASONS:
+            with self._lock:
+                try:
+                    # 预算必须短于探针超时：领导者已提交时内部的只读复核
+                    # 会立即返回，只有在领导者长时间持锁时才会等满。
+                    self._migration_state = bootstrap_database(
+                        self._conn, lock_timeout=2.0
+                    )
+                finally:
+                    # bootstrap 会把 busy_timeout 置 0；恢复请求期等待预算。
+                    self._conn.execute("PRAGMA busy_timeout=5000")
+        return self._migration_state.ready
 
     def close(self) -> None:
         with self._lock:

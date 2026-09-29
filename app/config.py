@@ -23,6 +23,7 @@ class Config:
     db_path: Path
     host: str
     port: int
+    migration_lock_timeout: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -30,7 +31,19 @@ class Config:
         db_path = Path(os.environ.get("DB_PATH", DEFAULT_DB_PATH))
         host = os.environ.get("HOST", "0.0.0.0")
         port = int(os.environ.get("PORT", "8080"))
-        return cls(fixtures_dir=fixtures_dir, db_path=db_path, host=host, port=port)
+        try:
+            lock_timeout = float(os.environ.get("MIGRATION_LOCK_TIMEOUT", "30"))
+        except ValueError:
+            raise AppError("MIGRATION_LOCK_TIMEOUT must be a number of seconds") from None
+        if lock_timeout < 0:
+            raise AppError("MIGRATION_LOCK_TIMEOUT must be non-negative")
+        return cls(
+            fixtures_dir=fixtures_dir,
+            db_path=db_path,
+            host=host,
+            port=port,
+            migration_lock_timeout=lock_timeout,
+        )
 
 
 def _load_json(path: Path) -> object:

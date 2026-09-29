@@ -28,7 +28,9 @@ services:
       - disruption-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      # 就绪探针：schema 迁移未完成或结构校验失败时不健康，编排层不向其转发流量。
+      # 存活探针 /healthz 与迁移诊断 /migrations 在未就绪时仍可回答。
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2); sys.exit(0 if json.load(r)['status']=='ready' else 1)"]
       interval: 3s
       timeout: 3s
       retries: 10

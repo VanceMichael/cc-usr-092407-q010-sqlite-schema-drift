@@ -11,6 +11,7 @@ COPY app/ ./app/
 COPY fixtures/ ./fixtures/
 COPY tests/ ./tests/
 COPY scripts/selftest_client.py ./scripts/selftest_client.py
+COPY scripts/legacy_db.py ./scripts/legacy_db.py
 
 RUN addgroup -S app && adduser -S -G app -h /srv app \
     && mkdir -p /data \
@@ -28,7 +29,9 @@ ENV PYTHONUNBUFFERED=1 \
 VOLUME ["/data"]
 EXPOSE 8080
 
+# 就绪探针决定容器是否健康：迁移未完成/结构被阻止时 /readyz 返回 503，
+# BusyBox wget 对 5xx 以非零码退出，容器判为不健康。
 HEALTHCHECK --interval=3s --timeout=3s --start-period=2s --retries=10 \
-    CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1
 
 CMD ["python", "-m", "app"]

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -25,6 +26,7 @@ BSR_CLOSE = "volc-bsr-close001"
 KTA_CLOSE = "volc-kta-close001"
 APS_REOPEN = "volc-aps-reopen01"
 APS_CLOSE_2 = "volc-aps-close002"
+LEGACY_CLOSE = "volc-kta-legacy01"
 
 FAILURES: list[str] = []
 
@@ -374,9 +376,20 @@ def seed() -> int:
         status, _ = request("GET", f"/api/v1/events/{invalid_id}")
         check(status == 404, f"rejected event '{invalid_id}' was never persisted")
 
-    print("== seed: health ==")
+    print("== seed: liveness / readiness / migration diagnostics ==")
     status, health = request("GET", "/healthz")
-    check(status == 200 and health["status"] == "ok", "health endpoint reports ok")
+    check(status == 200 and health["status"] == "ok", "healthz (liveness) reports ok")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready",
+          f"readyz reports ready (got {status} {ready.get('status')})")
+    check(ready.get("schema_version") == 2,
+          f"readyz reports schema_version 2 (got {ready.get('schema_version')})")
+    status, diag = request("GET", "/migrations")
+    check(status == 200 and diag["status"] == "ok", "migrations diagnostic reports ok")
+    check(diag["migration"]["state"] == "ready", "migration state is ready")
+    check("current_version" in diag["migration"], "migration diagnostic carries version")
+    check(str(BASE) not in json.dumps(diag) and "/" not in json.dumps(diag.get("migration", {})),
+          "migration diagnostic does not leak file paths")
 
     return finish("seed")
 
@@ -464,6 +477,128 @@ def verify() -> int:
     return finish("verify")
 
 
+def legacy_verify() -> int:
+    """旧版卷被新版本容器接管后的验证阶段。
+
+    数据库由 scripts/legacy_db.py 以 v1 结构预置；容器启动时必须自动完成
+    v1 -> v2 迁移，并且：
+    * /readyz 就绪、/migrations 显示 leader 迁移了 4 个步骤（首次）或已复核；
+    * 旧事件与影响结果完整保留；
+    * 原事件可继续幂等重放，结果与升级后查询一致；
+    * 再发起一次相同重放，replay_count 继续累加。
+    """
+
+    print("== legacy: service auto-migrated and is ready ==")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready",
+          f"readyz ready after legacy upgrade (got {status})")
+    check(ready.get("schema_version") == 2, "schema reached version 2")
+
+    status, diag = request("GET", "/migrations")
+    migration = diag.get("migration", {})
+    check(status == 200 and diag.get("status") == "ok",
+          "migration diagnostic ok after legacy upgrade")
+    check(migration.get("current_version") == 2, "diagnostic current_version=2")
+    check(migration.get("state") == "ready", "diagnostic state=ready")
+    check(migration.get("role") in ("leader", "verified", "follower"),
+          f"migration role is one of leader/verified/follower (got {migration.get('role')})")
+
+    print("== legacy: pre-upgrade event and impacts survived ==")
+    status, legacy_status = request("GET", f"/api/v1/events/{LEGACY_CLOSE}")
+    check(status == 200, "legacy event is present after upgrade")
+    check(len(legacy_status.get("impacts", [])) == 1,
+          f"legacy KTA closure has 1 impact (got {len(legacy_status.get('impacts', []))})")
+    kx = impacts_by_flight(legacy_status).get("KX-099-20260908", {})
+    check(kx.get("impact_status") == "delayed", "legacy KX099 stayed delayed")
+    check(kx.get("delay_minutes") == 20, "legacy KX099 delay stayed 20")
+    check(kx.get("proposed_departure") == "2026-09-07T18:00:00Z",
+          "legacy KX099 proposed departure preserved")
+    check(kx.get("crosses_midnight") is True, "legacy cross-midnight flag preserved")
+    expected_base = int(os.environ.get("EXPECT_REPLAY_BASE", "0"))
+    check(legacy_status["processing"]["replay_count"] == expected_base,
+          f"legacy replay_count matches expected base {expected_base} "
+          f"(got {legacy_status['processing']['replay_count']})")
+
+    print("== legacy: idempotent replay of the original event still works ==")
+    replay_payload = {
+        "event_id": LEGACY_CLOSE,
+        "event_version": 1,
+        "event_type": "airport.closed",
+        "airport_code": "KTA",
+        "effective_from": "2026-09-07T16:30:00Z",
+        "effective_until": "2026-09-07T18:00:00Z",
+        "reported_at": "2026-09-07T14:10:00Z",
+        "reason": "legacy ash plume (written by v1 service)",
+    }
+    count_before = legacy_status["processing"]["replay_count"]
+    status, replayed = post_event(replay_payload)
+    check(status == 201 and replayed["processing_state"] == "replayed",
+          "legacy event replays after upgrade")
+    check(replayed["impacts"] == legacy_status["impacts"],
+          "replay result matches preserved impacts")
+    status, again = request("GET", f"/api/v1/events/{LEGACY_CLOSE}")
+    check(again["processing"]["replay_count"] == count_before + 1,
+          f"legacy replay_count advanced by one ({count_before} -> "
+          f"{again['processing']['replay_count']})")
+
+    # 第二次幂等重放确认升级后的写入路径完全正常（重复重启后本阶段会反复跑）。
+    status, replayed2 = post_event(dict(replay_payload))
+    check(status == 201 and replayed2["processing_state"] == "replayed",
+          "second legacy replay accepted")
+    status, again2 = request("GET", f"/api/v1/events/{LEGACY_CLOSE}")
+    check(again2["processing"]["replay_count"] == count_before + 2,
+          f"legacy replay_count advanced by two ({count_before} -> "
+          f"{again2['processing']['replay_count']})")
+
+    return finish("legacy-verify")
+
+
+def probes(expect: str) -> int:
+    """独立探针检查：expect=ready 要求三端点状态一致；expect=blocked 时
+    /healthz 仍存活、/readyz 503、/migrations 给出 blocked 诊断。"""
+
+    print(f"== probes: expecting {expect} ==")
+    health_status, health = request("GET", "/healthz")
+    check(health_status == 200 and health.get("status") == "ok",
+          "liveness /healthz stays 200 ok regardless of readiness")
+
+    ready_status, ready = request("GET", "/readyz")
+    diag_status, diag = request("GET", "/migrations")
+    check(diag_status == 200, "diagnostic endpoint always answers 200")
+    migration = diag.get("migration", {})
+    rendered = json.dumps(diag)
+    check("/data/" not in rendered and ".db" not in rendered,
+          "diagnostics never expose storage paths")
+
+    if expect == "ready":
+        check(ready_status == 200 and ready.get("status") == "ready",
+              "readyz reports ready")
+        check(diag.get("status") == "ok" and migration.get("state") == "ready",
+              "migration diagnostic state ready")
+    elif expect == "blocked":
+        check(ready_status == 503 and ready.get("status") == "not_ready",
+              f"readyz reports 503 not_ready (got {ready_status})")
+        check(diag.get("status") == "blocked", "migration diagnostic state blocked")
+        check(bool(migration.get("reason")), "blocked diagnostic carries a reason code")
+        # 阻断状态下业务路径一律不接流量。
+        status, body = post_event({
+            "event_id": "evt-mustnotwrite1",
+            "event_version": 1,
+            "event_type": "airport.closed",
+            "airport_code": "APS",
+            "effective_from": "2026-09-07T15:00:00Z",
+            "effective_until": "2026-09-07T19:00:00Z",
+            "reported_at": "2026-09-07T14:00:00Z",
+        })
+        check(status == 503 and body.get("error", {}).get("code") == "service_unavailable",
+              f"business traffic rejected with 503 while blocked (got {status})")
+        status, _ = request("GET", "/api/v1/flights/affected")
+        check(status == 503, "query traffic also rejected while blocked")
+    else:
+        check(False, f"unknown probes expectation: {expect}")
+    return finish(f"probes-{expect}")
+
+
 def finish(phase: str) -> int:
     if FAILURES:
         print(f"\n{phase.upper()} FAILED: {len(FAILURES)} assertion(s) failed")
@@ -480,6 +615,12 @@ def main() -> int:
         return seed()
     if phase == "verify":
         return verify()
+    if phase == "legacy-verify":
+        return legacy_verify()
+    if phase == "probes-ready":
+        return probes("ready")
+    if phase == "probes-blocked":
+        return probes("blocked")
     print(f"unknown phase: {phase}", file=sys.stderr)
     return 2
 
